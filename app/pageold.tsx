@@ -24,43 +24,16 @@ type Entry = {
 };
 
 /* ==================== Helpers ==================== */
-// ---- autofill helpers ----
-const norm = (s: string) => s.trim().toLowerCase();
 
-type Meta = { category?: string; unit?: string; ref_low?: number; ref_high?: number };
-
-function lookupMetaFromDB(test: string, db: Entry[]): Meta {
-  const key = norm(test);
-  const out: Meta = {};
-  // scan from newest to oldest
-  for (let i = db.length - 1; i >= 0; i--) {
-    const e = db[i];
-    if (norm(e.test) !== key) continue;
-    if (out.category == null && e.category) out.category = e.category;
-    if (out.unit == null && e.unit) out.unit = e.unit;
-    if (out.ref_low == null && e.ref_low != null) out.ref_low = e.ref_low;
-    if (out.ref_high == null && e.ref_high != null) out.ref_high = e.ref_high;
-    if (out.category && out.unit && out.ref_low != null && out.ref_high != null) break;
-  }
-  return out;
-}
-
-function applyMetaIfMissing(row: Entry, db: Entry[]): Entry {
-  const m = lookupMetaFromDB(row.test, db);
-  return {
-    ...row,
-    category: row.category ?? m.category,
-    unit: (row.unit && row.unit.trim()) ? row.unit : (m.unit ?? undefined),
-    ref_low: row.ref_low ?? m.ref_low,
-    ref_high: row.ref_high ?? m.ref_high,
-  };
-}
 // Better date formatting without date-fns
 const dateFmt = new Intl.DateTimeFormat("en-GB", { day: "2-digit", month: "short", year: "numeric" });
 function formatDate(iso: string) {
   const d = new Date(iso);
   return Number.isNaN(d.getTime()) ? iso : dateFmt.format(d);
 }
+
+// Normalize test names for comparisons
+const norm = (s: string) => s.trim().toLowerCase();
 
 // ===== pdf.js v5 helper (uses workerPort vs workerSrc) =====
 async function getPdfjs() {
@@ -169,23 +142,12 @@ function toISO(d: string): string | null {
 // Parse free text lines like:
 // "PSA 56 µg/L (ref 0–4)" or "Vitamin D 137 nmol/L 50–150" or with a preceding "Collected: 11/07/2025"
 function parsePathologyText(text: string): Entry[] {
-  // 🔹 Normalize OCR quirks first: collapse spaced dots and excess spacing
-  const normalized = text
-    .replace(/\s*\.\s*/g, ".")          // "Hb . A1c" -> "Hb.A1c"
-    .replace(/[^\S\r\n]+/g, " ");       // collapse runs of spaces (not newlines)
-
-  const lines = normalized.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
+  const lines = text.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
   const entries: Entry[] = [];
   let currentDate: string | null = null;
   const today = new Date().toISOString().slice(0,10);
-
   const dateHeader = /(collected|date|reported)\s*[:\-]?\s*(\d{1,2}[\/-]\d{1,2}[\/-]\d{2,4}|\d{4}[\/-]\d{1,2}[\/-]\d{1,2})/i;
-
-  // 🔹 Updated regex:
-  //  - Allow dot '.' and underscore '_' inside test names
-  //  - Keep existing allowed chars (space, slash, ^, %, (), -)
-  //  - Accept both μ and µ variants in units
-  const re = /^([A-Za-z][A-Za-z0-9 ._\/\^%()-]+?)\s*[:\-]?\s*([+-]?\d+(?:\.\d+)?)\s*([A-Za-zμµ\/\^%0-9]*?)\s*(?:\((?:ref(?:erence)?\s*)?([+-]?\d+(?:\.\d+)?)\s*[–\-~]\s*([+-]?\d+(?:\.\d+)?)\)|([+-]?\d+(?:\.\d+)?)\s*[–\-~]\s*([+-]?\d+(?:\.\d+)?))?/i;
+  const re = /^([A-Za-z][A-Za-z0-9 \/\^%()-]+?)\s*[:\-]?\s*([+-]?\d+(?:\.\d+)?)\s*([A-Za-zμ\/\^%0-9]*?)\s*(?:\((?:ref(?:erence)?\s*)?([+-]?\d+(?:\.\d+)?)\s*[–\-~]\s*([+-]?\d+(?:\.\d+)?)\)|([+-]?\d+(?:\.\d+)?)\s*[–\-~]\s*([+-]?\d+(?:\.\d+)?))?/i;
 
   for (const raw of lines) {
     const line = raw.replace(/^\*{0,3}[xk]?\s*/, "");
@@ -194,11 +156,8 @@ function parsePathologyText(text: string): Entry[] {
 
     const m = line.match(re);
     if (!m) continue;
-
     const [, testName, valStr, unit = "", ref1, ref2, ref3, ref4] = m as any;
-    const value = Number(valStr);
-    if (!isFinite(value)) continue;
-
+    const value = Number(valStr); if (!isFinite(value)) continue;
     const ref_low  = (ref1 ?? ref3) ? Number(ref1 ?? ref3) : undefined;
     const ref_high = (ref2 ?? ref4) ? Number(ref2 ?? ref4) : undefined;
 
@@ -351,17 +310,14 @@ export default function PathologyTracker() {
       parsedEntries = parsePathologyText(text);
     }
 
-  if (parsedEntries.length === 0) {
-    setImportStatus("No valid entries found.");
-    console.log("Raw text sample:\n", text.slice(0, 4000));
-    return;
-  }
+    if (parsedEntries.length === 0) {
+      setImportStatus("No valid entries found.");
+      console.log("Raw text sample:\n", text.slice(0, 4000));
+      return;
+    }
 
-  // 🔹 Autofill category/unit/ref_low/ref_high from existing DB entries
-  const enriched = parsedEntries.map(row => applyMetaIfMissing(row, entries));
-
-  setEntries(prev => [...prev, ...enriched]);
-  setImportStatus(`Imported ${enriched.length} rows from ${file.name}`);
+    setEntries(prev => [...prev, ...parsedEntries]);
+    setImportStatus(`Imported ${parsedEntries.length} rows from ${file.name}`);
   };
 
   /* ===== Chart lines ===== */
