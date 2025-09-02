@@ -3,7 +3,7 @@ import { useState, useEffect } from "react";
 import dynamic from "next/dynamic";
 import RequireAuth from "@/components/RequireAuth"; 
 import { supabase } from "@/lib/supabaseClient";
-import type { ComponentType } from "react";
+import { Customized } from "recharts";
 
 // Recharts (loaded client-side)
 const ResponsiveContainer = dynamic(() => import("recharts").then(m => m.ResponsiveContainer), { ssr: false });
@@ -13,14 +13,10 @@ const XAxis                = dynamic(() => import("recharts").then(m => m.XAxis)
 const YAxis                = dynamic(() => import("recharts").then(m => m.YAxis),                { ssr: false });
 const Tooltip              = dynamic(() => import("recharts").then(m => m.Tooltip),              { ssr: false });
 const CartesianGrid        = dynamic(() => import("recharts").then(m => m.CartesianGrid),        { ssr: false });
-/*const Customized = dynamic(
-  () => import("@/components/CustomizedWrapper"),
-  { ssr: false }
-);*/
-const Customized = dynamic(async () => {
-  const m = await import("recharts");
-  return { default: m.Customized as unknown as ComponentType<any> };
-}, { ssr: false });
+//const Customized = dynamic(async () => {
+//  const m = await import("recharts");
+//  return { default: m.Customized as unknown as ComponentType<any> };
+//}, { ssr: false });
 
 /* ==================== Types ==================== */
 type Entry = {
@@ -1039,22 +1035,23 @@ export default function PathologyTracker() {
                 <Tooltip content={<CustomTooltip />} />
 
                 {/* CUSTOM REFERENCE BANDS */}
-                <Customized
-                  component={(props: any) => {
-                    const bandData = entries.filter(
-                      (e) => e.test === selectedTest && e.ref_low != null && e.ref_high != null
-                    );
-                    return (
-                      <ReferenceBands
-                        {...props}
-                        data={bandData}
-                        xAccessor="date"
-                        yLowAccessor="ref_low"
-                        yHighAccessor="ref_high"
-                      />
-                    );
-                  }}
-                />
+                {(() => {
+                  const bandData = entries.filter(
+                    (e) => e.test === selectedTest && e.ref_low != null && e.ref_high != null
+                  );
+                  return (
+                    <Customized
+                      component={
+                        <ReferenceBands
+                          data={bandData}
+                          xAccessor="date"
+                          yLowAccessor="ref_low"
+                          yHighAccessor="ref_high"
+                        />
+                      }
+                    />
+                  );
+                })()}
 
                 {renderTestLines()}
               </LineChart>
