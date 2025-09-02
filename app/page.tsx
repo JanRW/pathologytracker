@@ -3,6 +3,7 @@ import { useState, useEffect } from "react";
 import dynamic from "next/dynamic";
 import RequireAuth from "@/components/RequireAuth"; 
 import { supabase } from "@/lib/supabaseClient";
+import type { ComponentType } from "react";
 
 // Recharts (loaded client-side)
 const ResponsiveContainer = dynamic(() => import("recharts").then(m => m.ResponsiveContainer), { ssr: false });
@@ -12,7 +13,11 @@ const XAxis                = dynamic(() => import("recharts").then(m => m.XAxis)
 const YAxis                = dynamic(() => import("recharts").then(m => m.YAxis),                { ssr: false });
 const Tooltip              = dynamic(() => import("recharts").then(m => m.Tooltip),              { ssr: false });
 const CartesianGrid        = dynamic(() => import("recharts").then(m => m.CartesianGrid),        { ssr: false });
-const Customized           = dynamic(() => import("recharts").then(m => m.Customized),           { ssr: false });
+const Customized = dynamic(async () => {
+  const m = await import("recharts");
+  // Cast to ComponentType to satisfy Next’s dynamic() typings
+  return { default: m.Customized as unknown as ComponentType<any> };
+}, { ssr: false });
 
 /* ==================== Types ==================== */
 type Entry = {
