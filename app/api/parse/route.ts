@@ -1,11 +1,10 @@
+// app/api/parse/route.ts
 import { NextResponse } from "next/server";
+import { cookies } from "next/headers";
+import { createServerClient } from "@supabase/ssr";
 import OpenAI from "openai";
 
-/**
- * ENV SUPPORT:
- * - OPENAI_API_KEY=sk-...
- * - MOCK_PARSE=1            // optional: returns a stubbed parse for local dev
- */
+const TABLE_NAME = "pathology_results"; // <-- change if your table is named differently
 
 const openai = process.env.OPENAI_API_KEY
   ? new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
@@ -13,22 +12,15 @@ const openai = process.env.OPENAI_API_KEY
 
 const isMock = process.env.MOCK_PARSE === "1";
 
-/** simple exponential backoff for 429s */
+// Simple exponential backoff for 429s
 async function withBackoff<T>(fn: () => Promise<T>, attempts = 3): Promise<T> {
-  let delay = 800;
-  let lastErr: any = null;
+  let delay = 800, lastErr: any = null;
   for (let i = 0; i < attempts; i++) {
-    try {
-      return await fn();
-    } catch (err: any) {
+    try { return await fn(); } catch (err: any) {
       lastErr = err;
-      // OpenAI 429s often include rate/quota messages
       const status = err?.status || err?.response?.status;
       if (status !== 429) throw err;
-      if (i < attempts - 1) {
-        await new Promise((r) => setTimeout(r, delay));
-        delay *= 2; // backoff
-      }
+      if (i < attempts - 1) { await new Promise(r => setTimeout(r, delay)); delay *= 2; }
     }
   }
   throw lastErr;
@@ -36,101 +28,131 @@ async function withBackoff<T>(fn: () => Promise<T>, attempts = 3): Promise<T> {
 
 export async function POST(req: Request) {
   try {
-    // Accept either JSON { text } or multipart with "text" field (low-cost path)
-    const contentType = req.headers.get("content-type") || "";
+    // 1) Accept JSON {text} OR multipart with "text" OR "file"
+    const ct = req.headers.get("content-type") || "";
     let textInput = "";
 
-    if (contentType.includes("application/json")) {
+    if (ct.includes("application/json")) {
       const { text } = await req.json();
       textInput = (text || "").toString().trim();
-    } else if (contentType.includes("multipart/form-data")) {
+    } else if (ct.includes("multipart/form-data")) {
       const form = await req.formData();
       const text = form.get("text");
-      // NOTE: we are intentionally NOT accepting files here while you are over quota.
-      textInput = (text || "").toString().trim();
+      const file = form.get("file") as File | null;
+      if (text) textInput = String(text);
+      else if (file) textInput = await file.text();
     }
 
     if (!textInput) {
-      return NextResponse.json(
-        { error: "No text provided. Paste your pathology text." },
-        { status: 400 }
-      );
+      return NextResponse.json({ error: "No text provided." }, { status: 400 });
     }
 
-    // Mock mode for offline/local dev
+    // 2) Parse -> rows
+    let rows: Array<{ date: string; test: string; value: number; unit?: string; ref_range?: string }>;
+
     if (isMock || !openai) {
-      const mock = [
+      rows = [
         { date: "2025-07-11", test: "PSA", value: 56, unit: "ng/mL", ref_range: "0–4" },
         { date: "2025-07-11", test: "Neutrophils", value: 1.6, unit: "10^9/L", ref_range: "1.8–7.5" },
         { date: "2025-07-11", test: "Platelets", value: 119, unit: "10^9/L", ref_range: "150–400" }
       ];
-      return NextResponse.json(mock);
+    } else {
+      const completion = await withBackoff(() =>
+        openai.chat.completions.create({
+          model: "gpt-4o-mini",
+          temperature: 0,
+          response_format: { type: "json_object" },
+          messages: [
+            { role: "system", content: "Return ONLY JSON { rows: [{date,test,value,unit,ref_range}] }" },
+            {
+              role: "user",
+              content:
+                "Extract all pathology results (date, test name, numeric value, unit if present, reference range if present) from the text below.\n\nTEXT:\n" +
+                textInput
+            }
+          ]
+        })
+      );
+
+      const raw = completion.choices?.[0]?.message?.content || "{}";
+      let parsed: any;
+      try {
+        parsed = JSON.parse(raw);
+      } catch {
+        if (raw.trim().startsWith("[")) parsed = { rows: JSON.parse(raw) };
+        else throw new Error("Model did not return valid JSON.");
+      }
+      const arr = Array.isArray(parsed.rows) ? parsed.rows : [];
+      rows = arr
+        .map((r: any) => ({
+          date: (r.date || "").toString(),
+          test: (r.test || r.name || "").toString(),
+          value: typeof r.value === "number" ? r.value : Number(r.value),
+          unit: r.unit ? String(r.unit) : undefined,
+          ref_range: r.ref_range ? String(r.ref_range) : undefined
+        }))
+        .filter((r: any) => r.date && r.test && !Number.isNaN(r.value));
     }
 
-    // Call OpenAI with JSON-only output instruction to reduce errors + cost.
-    const completion = await withBackoff(async () =>
-      openai!.chat.completions.create({
-        model: "gpt-4o-mini",
-        temperature: 0,
-        response_format: { type: "json_object" }, // enforce JSON
-        messages: [
-          {
-            role: "system",
-            content:
-              "You are a pathology report parser. Return ONLY a JSON object with a field `rows` = array of {date,test,value,unit,ref_range}. No extra text."
-          },
-          {
-            role: "user",
-            content:
-              "Extract all pathology results (date, test name, numeric value, unit if present, reference range if present) from the text below.\n\nTEXT:\n" +
-              textInput
-          }
-        ]
-      })
+    if (!rows.length) {
+      return NextResponse.json({ error: "No rows parsed." }, { status: 422 });
+    }
+
+    // 3) Create Supabase client with cookie bridge (so RLS sees the user)
+    const supabase = createServerClient(
+      process.env.NEXT_PUBLIC_SUPABASE_URL!,
+      process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
+      {
+        cookies: {
+          getAll: () => cookies().getAll(),
+          setAll: (list) => list.forEach(({ name, value, options }) => cookies().set(name, value, options)),
+        },
+      }
     );
 
-    const raw = completion.choices?.[0]?.message?.content || "{}";
-    let parsed: any = {};
-    try {
-      parsed = JSON.parse(raw);
-    } catch {
-      // try to salvage arrays printed directly
-      if (raw.trim().startsWith("[")) {
-        parsed = { rows: JSON.parse(raw) };
-      } else {
-        throw new Error("Model did not return valid JSON.");
+    // Make sure there is a session; otherwise inserts will 401/403 with RLS
+    const { data: sess } = await supabase.auth.getSession();
+    if (!sess.session) {
+      return NextResponse.json({ error: "Not signed in." }, { status: 401 });
+    }
+
+    // 4) Map to your table schema
+    //    - If your table already uses "date" (text) keep it.
+    //    - If you use a timestamp column (e.g., measured_at), derive it below.
+    const payload = rows.map(r => ({
+      date: r.date,                         // keep if your table has a 'date' text column
+      test: r.test,
+      value: r.value,
+      unit: r.unit,
+      ref_range: r.ref_range,
+      measured_at: new Date(r.date).toISOString(), // remove if your schema doesn't have this
+      source: "upload",                     // optional if you track provenance
+      // user_id will be set automatically if your column default is auth.uid()
+    }));
+
+    // 5) Insert in chunks and collect inserted rows
+    const inserted: any[] = [];
+    for (let i = 0; i < payload.length; i += 500) {
+      const chunk = payload.slice(i, i + 500);
+      const { data, error, status } = await supabase
+        .from(TABLE_NAME)
+        .insert(chunk)
+        .select();
+
+      if (error) {
+        // 403 → RLS policy missing; 401 → no session; handle clearly
+        const msg = `[parse] insert failed (${status}): ${error.message}`;
+        console.error(msg, error);
+        return NextResponse.json({ error: msg }, { status: status || 400 });
       }
+      if (data?.length) inserted.push(...data);
     }
 
-    const rows = Array.isArray(parsed.rows) ? parsed.rows : [];
-    // Minimal validation/normalization
-    const cleaned = rows
-      .map((r: any) => ({
-        date: (r.date || "").toString(),
-        test: (r.test || r.name || "").toString(),
-        value: typeof r.value === "number" ? r.value : Number(r.value),
-        unit: r.unit ? String(r.unit) : undefined,
-        ref_range: r.ref_range ? String(r.ref_range) : undefined
-      }))
-      .filter((r: any) => r.date && r.test && !Number.isNaN(r.value));
-
-    return NextResponse.json(cleaned);
+    return NextResponse.json({ data: inserted }, { status: 200 });
   } catch (err: any) {
-    const status = err?.status || err?.response?.status;
-    const msg = err?.message || "Parsing failed.";
-
-    // Special-case 429s to show a friendly message
-    if (status === 429 || /quota|rate limit/i.test(msg)) {
-      return NextResponse.json(
-        {
-          error:
-            "OpenAI quota/rate limit exceeded. Please check billing/usage. You can still paste text to parse (low cost)."
-        },
-        { status: 429 }
-      );
-    }
-
-    console.error("Parse error:", err);
-    return NextResponse.json({ error: msg }, { status: status || 500 });
+    const status = err?.status || err?.response?.status || 500;
+    const msg = err?.message || "Server error";
+    console.error("Parse/Save error:", err);
+    return NextResponse.json({ error: msg }, { status });
   }
 }

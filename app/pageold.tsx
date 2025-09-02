@@ -9,8 +9,8 @@ const Line                 = dynamic(() => import("recharts").then(m => m.Line),
 const XAxis                = dynamic(() => import("recharts").then(m => m.XAxis),                { ssr: false });
 const YAxis                = dynamic(() => import("recharts").then(m => m.YAxis),                { ssr: false });
 const Tooltip              = dynamic(() => import("recharts").then(m => m.Tooltip),              { ssr: false });
-const CartesianGrid        = dynamic(() => import("recharts").then(m => m.CartesianGrid),        { ssr: false });
-const Customized           = dynamic(() => import("recharts").then(m => m.Customized),           { ssr: false });
+//const CartesianGrid        = dynamic(() => import("recharts").then(m => m.CartesianGrid),        { ssr: false });
+//const Customized           = dynamic(() => import("recharts").then(m => m.Customized),           { ssr: false });
 
 /* ==================== Types ==================== */
 type Entry = {
