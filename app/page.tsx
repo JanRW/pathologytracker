@@ -13,9 +13,12 @@ const XAxis                = dynamic(() => import("recharts").then(m => m.XAxis)
 const YAxis                = dynamic(() => import("recharts").then(m => m.YAxis),                { ssr: false });
 const Tooltip              = dynamic(() => import("recharts").then(m => m.Tooltip),              { ssr: false });
 const CartesianGrid        = dynamic(() => import("recharts").then(m => m.CartesianGrid),        { ssr: false });
+/*const Customized = dynamic(
+  () => import("@/components/CustomizedWrapper"),
+  { ssr: false }
+);*/
 const Customized = dynamic(async () => {
   const m = await import("recharts");
-  // Cast to ComponentType to satisfy Next’s dynamic() typings
   return { default: m.Customized as unknown as ComponentType<any> };
 }, { ssr: false });
 
