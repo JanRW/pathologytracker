@@ -6,6 +6,7 @@ import { supabase } from "@/lib/supabaseClient";
 //import { Customized } from "recharts";
 import type { ComponentType } from "react";
 import { Customized as RechartsCustomized } from "recharts";
+import { ensureCategory, ensureTest} from "@/lib/db";
 
 // Recharts (loaded client-side)
 const ResponsiveContainer = dynamic(() => import("recharts").then(m => m.ResponsiveContainer), { ssr: false });
@@ -23,14 +24,31 @@ const Customized           = RechartsCustomized as unknown as ComponentType<any>
 
 /* ==================== Types ==================== */
 type Entry = {
-  id?: string;
-  date: string;     // ISO-like date string
+  id?: string | number;
+  test_id?: number;         // NEW
+  category_id?: number | null; // NEW
+  date: string;     // taken_at (DATE)
   category?: string;
-  test: string;     // e.g., PSA, Glucose, Neutrophils
+  test: string;
   value: number;
   unit?: string;
   ref_low?: number;
   ref_high?: number;
+};
+
+type VRow = {
+  id: string;
+  user_id: string;
+  test_id: number | null;
+  category_id: number | null;
+  value: number;
+  taken_at: string;
+  notes: string | null;
+  category: string | null;
+  test_name: string;
+  unit_effective: string | null;
+  ref_low_effective: number | null;
+  ref_high_effective: number | null;
 };
 
 /* ==================== Helpers ==================== */
@@ -226,6 +244,13 @@ function parsePathologyText(text: string): Entry[] {
   return entries;
 }
 
+const toMsg = (e: any) =>
+  (e && typeof e === "object" && "message" in e)
+    ? (e as any).message
+    : typeof e === "string"
+      ? e
+      : JSON.stringify(e);
+
 /* ==================== Component ==================== */
 
 const ReferenceBands = ({ xAxisMap, yAxisMap, data, xAccessor, yLowAccessor, yHighAccessor }: any) => {
@@ -283,9 +308,10 @@ export default function PathologyTracker() {
   const [manual, setManual] = useState<any>({ date: "", category: "", test: "", value: "", unit: "", ref_low: undefined, ref_high: undefined });
   const [useCustomCategory, setUseCustomCategory] = useState(false);
   const [useCustomTest, setUseCustomTest] = useState(false);
-  const [editId, setEditId] = useState<string | null>(null);
+  const [editId, setEditId] = useState<string | number |null>(null);
   const [editRow, setEditRow] = useState<Entry | null>(null);
-
+  const [editBase, setEditBase] = useState<Entry | null>(null);
+  
   // Sorting & Filtering
   const [sortField, setSortField] = useState<keyof Entry>("date");
   const [sortAsc, setSortAsc] = useState(true);
@@ -315,8 +341,9 @@ export default function PathologyTracker() {
 
     setImportStatus(`Reading ${file.name}…`);
 
-    // 1) Parse the file exactly like you do now
+    // 1) Parse file content (re-using your helpers)
     const { kind, text } = await extractTextFromAnyFile(file, s => setImportStatus(s));
+
     let parsedEntries: Entry[] = [];
 
     if (kind === "csv" || kind === "tsv") {
@@ -327,16 +354,18 @@ export default function PathologyTracker() {
         for (let i = 1; i < raw.length; i++) {
           if (!raw[i]?.trim()) continue;
           const cells = raw[i].split(sep);
-          const get = (name: string) => { const idx = headers.indexOf(name); return idx >= 0 ? (cells[idx]||"").trim() : ""; };
+          const get = (name: string) => {
+            const idx = headers.indexOf(name);
+            return idx >= 0 ? (cells[idx] || "").trim() : "";
+          };
           const date  = get("date") || get("collected");
           const test  = get("test") || get("analyte") || get("name");
           const value = Number((get("value") || get("result") || "").replace(/[^0-9.\-]/g, ""));
           if (!date || !test || !isFinite(value)) continue;
-          const unit = get("unit");
+          const unit = get("unit") || undefined;
           const rl = Number(get("ref low") || get("ref_low")); const ref_low  = isFinite(rl) ? rl : undefined;
           const rh = Number(get("ref high") || get("ref_high")); const ref_high = isFinite(rh) ? rh : undefined;
-
-          parsedEntries.push({ date, test, value, unit: unit || undefined, ref_low, ref_high });
+          parsedEntries.push({ date, test, value, unit, ref_low, ref_high });
         }
       }
     } else if (kind === "json") {
@@ -344,88 +373,90 @@ export default function PathologyTracker() {
         const data = JSON.parse(text);
         const rows: any[] = Array.isArray(data) ? data : (data.rows || []);
         for (const r of rows) {
-          if (!r) continue;
           const value = Number(r.value);
-          if (!r.date || !r.test || !isFinite(value)) continue;
+          if (!r?.date || !r?.test || !isFinite(value)) continue;
           parsedEntries.push({
-            date: r.date, test: r.test, value,
-            unit: r.unit || undefined,
+            date: r.date,
+            test: String(r.test),
+            value,
+            unit: r.unit ?? undefined,
             ref_low: r.ref_low ?? undefined,
             ref_high: r.ref_high ?? undefined,
-            category: r.category || undefined
+            category: r.category ?? undefined,
           });
         }
       } catch {
         setImportStatus("Invalid JSON file.");
       }
     } else {
-      // pdf/image/txt → OCR/parse (your helper)
+      // pdf/image/txt → OCR/parse (your existing function)
       parsedEntries = parsePathologyText(text);
     }
 
     if (parsedEntries.length === 0) {
       setImportStatus("No valid entries found.");
-      console.log("Raw text sample:\n", text.slice(0, 4000));
+      console.log("Raw text sample:\n", text.slice(0, 2000));
       return;
     }
 
-    // 2) Enrich with your autofill from prior entries
-    const enriched = parsedEntries.map(row => applyMetaIfMissing(row, entries));
-
-    // 3) Ensure we have a signed-in user (RequireAuth should guarantee this)
+    // 2) user must be signed in
     const { data: { user } } = await supabase.auth.getUser();
-    if (!user) {
-      alert("Not signed in");
-      return;
+    if (!user) { alert("Not signed in"); return; }
+
+    // 3) resolve FKs with small caches (minimize round trips)
+    const catCache = new Map<string, number>();
+    const testCache = new Map<string, number>();
+
+    async function getCategoryId(desc?: string) {
+      const key = (desc || "").trim().toLowerCase();
+      if (!key) return null;
+      if (catCache.has(key)) return catCache.get(key)!;
+      const id = await ensureCategory(supabase, desc || null);
+      if (id != null) catCache.set(key, id);
+      return id;
     }
 
-    // 4) Map to your Supabase table shape ("tests")
-    const payload = enriched.map(r => ({
-      user_id: user.id,
-      test_name: r.test,
-      category: r.category || null,
-      value: r.value,
-      unit: r.unit || null,
-      ref_low: r.ref_low ?? null,
-      ref_high: r.ref_high ?? null,
-      taken_at: r.date,
-      notes: null
-    }));
+    async function getTestId(name: string, meta: { category_id?: number | null; unit?: string|null; ref_low?: number|null; ref_high?: number|null }) {
+      const key = name.trim().toLowerCase();
+      if (testCache.has(key)) return testCache.get(key)!;
+      const t = await ensureTest(supabase, name, meta);
+      testCache.set(key, t.id);
+      return t.id;
+    }
 
-    // 5) Insert in chunks (avoids payload-too-large) and merge inserted rows back into UI
-    let insertedCount = 0;
-    for (let i = 0; i < payload.length; i += 500) {
-      const chunk = payload.slice(i, i + 500);
+    // 4) build measurement rows (user_id,test_id,taken_at unique)
+    const rows: any[] = [];
+    for (const r of parsedEntries) {
+      const category_id = await getCategoryId(r.category);
+      const test_id = await getTestId(r.test, {
+        category_id,
+        unit: r.unit ?? null,
+        ref_low: r.ref_low ?? null,
+        ref_high: r.ref_high ?? null,
+      });
+      rows.push({
+        user_id: user.id,
+        test_id,
+        category_id,
+        value: r.value,
+        taken_at: r.date,   // 'YYYY-MM-DD'
+        notes: null,
+      });
+    }
 
+    // 5) upsert in chunks (prevents payload-too-large)
+    let upserted = 0;
+    for (let i = 0; i < rows.length; i += 500) {
+      const chunk = rows.slice(i, i + 500);
       const { data, error } = await supabase
-        .from("tests")
-        .insert(chunk)
-        .select("id, test_name, category, value, unit, ref_low, ref_high, taken_at");
-
-      if (error) {
-        console.error("[upload] DB write failed:", error);
-        alert("Upload failed: " + error.message);
-        return;
-      }
-
-      // map returned rows to your Entry type and append to state
-      const mapped: Entry[] = (data || []).map((r: any) => ({
-        id: r.id,
-        date: r.taken_at,
-        category: r.category ?? undefined,
-        test: r.test_name,
-        value: Number(r.value),
-        unit: r.unit ?? undefined,
-        ref_low: r.ref_low ?? undefined,
-        ref_high: r.ref_high ?? undefined,
-      }));
-
-      setEntries(prev => [...prev, ...mapped]);
-      insertedCount += mapped.length;
+        .from(FACT_TABLE)
+        .upsert(chunk, { onConflict: "user_id,test_id,taken_at" })
+        .select("id");
+      if (error) { console.error(error); alert(error.message); return; }
+      upserted += data?.length ?? 0;
     }
 
-    setImportStatus(`Imported and saved ${insertedCount} row(s) from ${file.name}`);
-    // clear the input
+    setImportStatus(`Imported/updated ${upserted} row(s) from ${file.name}`);
     (e.target as HTMLInputElement).value = "";
   };
 
@@ -541,76 +572,131 @@ export default function PathologyTracker() {
 
   /* ===== Manual entry/actions ===== */
   const addManualEntry = async () => {
-    const { date, category, test, value, unit, ref_low, ref_high } = manual;
-    if (!date || !test || !value) { alert("Date, Test, and Value are required."); return; }
+    try {
+      const { date, category, test, value, unit, ref_low, ref_high } = manual;
+      if (!date || !test || value === "" || value === undefined) {
+        alert("Date, Test, and Value are required.");
+        return;
+      }
 
-    const { data: { user } } = await supabase.auth.getUser();
-    if (!user) { alert("Not signed in"); return; }
+      const { data: { user } } = await supabase.auth.getUser();
+      if (!user) { alert("Not signed in"); return; }
 
-    const insert = {
-      user_id: user.id,
-      test_name: test,
-      category: category || null,
-      value: Number(value),
-      unit: unit || null,
-      ref_low: ref_low ?? null,
-      ref_high: ref_high ?? null,
-      taken_at: date,
-      notes: null
-    };
+      const category_id = await ensureCategory(supabase, category);
+      const tc = await ensureTest(supabase, test, {
+        category_id,
+        unit: unit ?? null,
+        ref_low: ref_low ?? null,
+        ref_high: ref_high ?? null,
+      });
 
-    const { data, error } = await supabase
-      .from("tests")
-      .insert([insert])
-      .select("id, test_name, category, value, unit, ref_low, ref_high, taken_at")
-      .single();
+      const { data, error } = await supabase
+        .from("tests") // fact table
+        .upsert([{
+          user_id: user.id,
+          test_id: tc.id,
+          category_id: tc.category_id ?? category_id,
+          value: Number(value),
+          taken_at: date,
+          notes: null,
+        }], { onConflict: "user_id,test_id,taken_at" })
+        .select("id, test_id, category_id, value, taken_at")
+        .single();
 
-    if (error) { alert(error.message); return; }
+      if (error) throw error;
 
-    const newEntry: Entry = {
-      id: data.id,
-      date: data.taken_at,
-      category: data.category ?? undefined,
-      test: data.test_name,
-      value: Number(data.value),
-      unit: data.unit ?? undefined,
-      ref_low: data.ref_low ?? undefined,
-      ref_high: data.ref_high ?? undefined,
-    };
-
-    setEntries(prev => [...prev, newEntry]);
-    setManual({ date: "", category: "", test: "", value: "", unit: "", ref_low: undefined, ref_high: undefined });
-    setUseCustomCategory(false);
-    setUseCustomTest(false);
+      setEntries(prev => [...prev, {
+        id: data.id,
+        date: data.taken_at,
+        category,
+        test,
+        value: Number(data.value),
+        unit: unit || undefined,
+        ref_low: ref_low ?? undefined,
+        ref_high: ref_high ?? undefined,
+      }]);
+      setManual({ date: "", category: "", test: "", value: "", unit: "", ref_low: undefined, ref_high: undefined });
+      setUseCustomCategory(false);
+      setUseCustomTest(false);
+    } catch (e) {
+      console.error("addManualEntry failed:", e);
+      alert(toMsg(e));
+    }
   };
 
-  const startEdit = (entry: Entry) => {
-    setEditId(entry.id || `${entry.date}__${entry.test}`); // prefer DB id
-    setEditRow({ ...entry });
+  const startEdit = (row: Entry) => {
+    setEditId(row.id!);
+    setEditRow({ ...row });
+    setEditBase({ ...row });          // snapshot
   };
+
+  const FACT_TABLE = "tests"; // or use an env flag if you still write to `tests`
 
   const saveEdit = async () => {
-    if (!editId || !editRow) return;
+    try {
+      if (!editRow || !editBase || !editId) return;
+      const { data: { user } } = await supabase.auth.getUser();
+      if (!user) { alert("Not signed in"); return; }
 
-    // If this row has a DB id, update in Supabase
-    if (editRow.id) {
-      const patch = {
-        test_name: editRow.test,
-        category: editRow.category ?? null,
-        value: editRow.value,
-        unit: editRow.unit ?? null,
-        ref_low: editRow.ref_low ?? null,
-        ref_high: editRow.ref_high ?? null,
-        taken_at: editRow.date
+      const testChanged     = (editRow.test ?? "").trim() !== (editBase.test ?? "").trim();
+      const categoryChanged = (editRow.category ?? "").trim() !== (editBase.category ?? "").trim();
+      const metaChanged     = (editRow.unit !== editBase.unit) ||
+                              (editRow.ref_low !== editBase.ref_low) ||
+                              (editRow.ref_high !== editBase.ref_high);
+
+      let category_id = editRow.category_id ?? null;
+      if (categoryChanged) category_id = await ensureCategory(supabase, editRow.category);
+
+      let test_id = editRow.test_id!;
+      if (testChanged) {
+        const tc = await ensureTest(supabase, editRow.test, {
+          category_id,
+          unit: editRow.unit ?? null,
+          ref_low: editRow.ref_low ?? null,
+          ref_high: editRow.ref_high ?? null,
+        });
+        test_id = tc.id;
+        if (tc.category_id && tc.category_id !== category_id) category_id = tc.category_id;
+      } else if (metaChanged && editRow.test_id) {
+        const { error: eMeta } = await supabase
+          .from("tests_catalog")
+          .update({
+            unit: editRow.unit ?? null,
+            ref_low: editRow.ref_low ?? null,
+            ref_high: editRow.ref_high ?? null,
+          })
+          .eq("id", editRow.test_id);
+        if (eMeta) throw eMeta;
+      }
+
+      const patch: any = {
+        value: Number(editRow.value),
+        taken_at: editRow.date,
       };
-      const { error } = await supabase.from("tests").update(patch).eq("id", editRow.id);
-      if (error) { alert(error.message); return; }
-    }
+      if (testChanged)     patch.test_id = test_id;
+      if (categoryChanged) patch.category_id = category_id;
 
-    // Update local UI
-    setEntries(prev => prev.map(e => (e.id ? e.id : `${e.date}__${e.test}`) === editId ? { ...(editRow as Entry) } : e));
-    setEditId(null);
-    setEditRow(null);
+      const { error } = await supabase.from("tests").update(patch).eq("id", editId);
+      if (error) {
+        if ((error as any).code === "23505") {
+          alert("A measurement for this test already exists on this date. Change the date or test.");
+          return;
+        }
+        throw error;
+      }
+
+      setEntries(prev => prev.map(e => e.id === editId ? {
+        ...e,
+        test_id, category_id,
+        test: editRow.test, category: editRow.category,
+        value: Number(editRow.value), date: editRow.date,
+        unit: editRow.unit, ref_low: editRow.ref_low, ref_high: editRow.ref_high,
+      } : e));
+      setEditId(null); setEditRow(null); setEditBase(null);
+    } catch (e) {
+      console.error("saveEdit failed:", e);
+      alert(toMsg(e));
+    }
   };
 
   const cancelEdit = () => {
@@ -621,7 +707,7 @@ export default function PathologyTracker() {
   const removeRow = async (entry: Entry) => {
     const key = entry.id || `${entry.date}__${entry.test}`;
     if (entry.id) {
-      const { error } = await supabase.from("tests").delete().eq("id", entry.id);
+      const { error } = await supabase.from(FACT_TABLE).delete().eq("id", entry.id);
       if (error) { alert(error.message); return; }
     }
     setEntries(prev => prev.filter(e => (e.id ? e.id : `${e.date}__${e.test}`) !== key));
@@ -658,31 +744,42 @@ export default function PathologyTracker() {
 
     useEffect(() => {
       (async () => {
-        // require sign-in (RequireAuth already enforces this)
-        const { data, error } = await supabase
-          .from("tests")
-          .select("id, test_name, category, value, unit, ref_low, ref_high, taken_at")
-          .order("taken_at", { ascending: true });
-
-        if (error) {
-          console.error(error);
+        // Optional: confirm you’re signed in (RLS needs it)
+        const { data: sess, error: sessErr } = await supabase.auth.getSession();
+        if (sessErr) console.error("getSession error:", sessErr);
+        if (!sess?.session) {
+          console.warn("Not signed in; skipping fetch.");
           return;
         }
 
-        const mapped: Entry[] = (data || []).map((r: any) => ({
+        // Read from the view
+        const { data, error } = await supabase
+          .from("v_measurements")
+          .select("*")
+          .returns<VRow[]>()
+          .order("taken_at", { ascending: true });
+
+        if (error) {
+          console.error("v_measurements load error:", error);
+          return;
+        }
+
+        // Map the view row → your Entry type
+        const mapped: Entry[] = (data as VRow[]).map((r) => ({
           id: r.id,
           date: r.taken_at,
           category: r.category ?? undefined,
           test: r.test_name,
           value: Number(r.value),
-          unit: r.unit ?? undefined,
-          ref_low: r.ref_low ?? undefined,
-          ref_high: r.ref_high ?? undefined,
+          unit: r.unit_effective ?? undefined,
+          ref_low: r.ref_low_effective ?? undefined,
+          ref_high: r.ref_high_effective ?? undefined,
         }));
 
         setEntries(mapped);
       })();
     }, []);
+
   return (
     <RequireAuth>
       <div className="max-w-6xl mx-auto mt-10 p-6 bg-white rounded shadow space-y-6">
